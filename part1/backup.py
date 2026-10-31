@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 import zipfile
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 import google.auth
 from google.cloud import pubsub_v1
@@ -49,6 +49,18 @@ class RunTracker:
         else:
             self.seen[byte] |= mask
             self.unique += 1
+
+    # updates the total expected breadcrumbs
+    def update_total(self, new_total):
+        if new_total > self.total:
+            new_byte_len = (new_total + 7) // 8
+            current_byte_len = len(self.seen)
+
+            # extends the bytearray
+            if new_byte_len > current_byte_len:
+                self.seen.extend(b'\x00' * (new_byte_len - current_byte_len))
+        
+            self.total = new_total
 
     @property
     def missing(self):
@@ -197,42 +209,54 @@ def callback(message):
             run_id, seq, expected_total = attrs['run_id'], int(attrs['seq']), int(attrs['total'])
         except (KeyError, ValueError):
             untracked += 1
-        else:
-            # find the earliest and latest breadcrumb timestamps
-            opd_date = payload.get('OPD_DATE') if payload else None
-            act_time = payload.get('ACT_TIME') if payload else None
-            try:
-                breadcrumb_time = datetime.strptime(str(opd_date) + str(act_time).zfill(6),
-                                                    "%Y%m%d%H%M%S")
-                # if earliest_breadcrumb is empty, assign with new breadcrumb time
-                # otherwise, if the current breadcrumb_time is earlier, assign it
-                if (earliest_breadcrumb is None or breadcrumb_time < earliest_breadcrumb):
-                    earliest_breadcrumb = breadcrumb_time
-                # check the latest breadcrumb time
-                if (latest_breadcrumb is None or breadcrumb_time > latest_breadcrumb):
-                    latest_breadcrumb = breadcrumb_time
-            except ValueError:
-                invalid_timestamps += 1
+            message.ack()
+            return
 
-            # check the unique vehicle_ids
-            ve_id = payload.get('vehicle_id') if isinstance(payload, dict) else None
-            if ve_id is not None:    # if the id is valid
-                unique_vehicle_ids.add(ve_id)
-
-            # find the vehicle has no trip available
-            event_no_trip = payload.get('EVENT_NO_TRIP') if payload else None
-            if event_no_trip is not None:
-                unique_trips.add(event_no_trip)
-
-            # append breadcrumb to a backup file
-            if payload is not None and isinstance(payload, dict):
-                backup_file.write(json.dumps(payload, separators=(',', ':')) + '\n')
-
-            tracker = runs.setdefault(run_id, RunTracker(expected_total))
-            if 0 <= seq < tracker.total:
-                tracker.add(seq)
+        # find the earliest and latest breadcrumb timestamps
+        opd_date = payload.get('OPD_DATE') if payload else None
+        act_time = payload.get('ACT_TIME') if payload else None
+        try:
+            base_date = datetime.striptime(str(opd_date), "%Y%m%d")
+            breadcrumb_time = base_date + timedelta(seconds=int(act_time))
+            # if earliest_breadcrumb is empty, assign with new breadcrumb time
+            # otherwise, if the current breadcrumb_time is earlier, assign it
+            if (earliest_breadcrumb is None or breadcrumb_time < earliest_breadcrumb):
+                earliest_breadcrumb = breadcrumb_time
             else:
-                untracked += 1
+                invalid_timestamps += 1
+            # check the latest breadcrumb time
+            if (latest_breadcrumb is None or breadcrumb_time > latest_breadcrumb):
+                latest_breadcrumb = breadcrumb_time
+            else:
+                invalid_timestamps += 1
+        except ValueError:
+            invalid_timestamps += 1
+
+        # check the unique vehicle_ids
+        ve_id = payload.get('VEHICLE_ID') if isinstance(payload, dict) else None
+        if ve_id is not None:    # if the id is valid
+            unique_vehicle_ids.add(ve_id)
+
+        # find the vehicle has no trip available
+        event_no_trip = payload.get('EVENT_NO_TRIP') if payload else None
+        if event_no_trip is not None:
+            unique_trips.add(event_no_trip)
+
+        # append breadcrumb to a backup file
+        if payload is not None and isinstance(payload, dict):
+            backup_file.write(json.dumps(payload, separators=(',', ':')) + '\n')
+
+        tracker = runs.setdefault(run_id, RunTracker(expected_total))
+
+        # if the message's expected total is higher than the current total,
+        # update the current total to the message's expected total
+        if expected_total > tracker.total:
+            tracker.update_total(expected_total)
+
+        if 0 <= seq < tracker.total:
+            tracker.add(seq)
+        else:
+            untracked += 1
 
         # Ack even unparseable messages; they are counted above,
         # unacked would make Pub/Sub redeliver them forever
