@@ -129,7 +129,7 @@ def print_summary(today):
               f'   (publish to receive)')
     print(f'Untracked msgs     : {untracked}   (no run_id/seq attributes)')
     print(f'Bad payloads       : {bad_payloads}')
-    print(f'Earliest breadcrumb : {earliest_breadcrumb}')
+    print(f'Earliest breadcrumb: {earliest_breadcrumb}')
     print(f'Latest breadcrumb  : {latest_breadcrumb}')
     print(f'Unique vehicle IDs : {len(unique_vehicle_ids)}')
     print(f'Unique trips       : {len(unique_trips)}')
@@ -187,7 +187,7 @@ def callback(message):
         opd_date = payload.get('OPD_DATE') if payload else None
         act_time = payload.get('ACT_TIME') if payload else None
         try:
-            base_date = datetime.strptime(str(opd_date), "%Y%m%d")
+            base_date = datetime.strptime(str(opd_date), "%d%b%Y:%H:%M:%S")
             breadcrumb_time = base_date + timedelta(seconds=int(act_time))
             # if earliest_breadcrumb is empty, assign with new breadcrumb time
             # otherwise, if the current breadcrumb_time is earlier, assign it
