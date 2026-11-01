@@ -187,7 +187,7 @@ def callback(message):
         opd_date = payload.get('OPD_DATE') if payload else None
         act_time = payload.get('ACT_TIME') if payload else None
         try:
-            base_date = datetime.striptime(str(opd_date), "%Y%m%d")
+            base_date = datetime.strptime(str(opd_date), "%Y%m%d")
             breadcrumb_time = base_date + timedelta(seconds=int(act_time))
             # if earliest_breadcrumb is empty, assign with new breadcrumb time
             # otherwise, if the current breadcrumb_time is earlier, assign it
