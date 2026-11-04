@@ -4,6 +4,7 @@
 # Usage: python3 analysis.py analysis_sub
 
 import json
+import logging
 import os
 import sys
 import threading
@@ -20,6 +21,15 @@ SUBSCRIPTION_ID = 'analysis_sub'
 
 # How many messages can be held unacknowledged at once
 flow_control = FlowControl(max_messages=1000)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+# Portland area boundaries
+PDXAREA_LAT_MIN, PDX_AREA_LAT_MAX = 45.0, 46.0
+PDXAREA_LON_MIN, PDX_AREA_LON_MAX = -123.5, -122.0
 
 
 # Check if the project ID exists
@@ -93,6 +103,11 @@ unique_vehicle_ids = set()    # the number of unique vehicle IDs
 unique_trips = set()          # the number of unique trips
 invalid_timestamps = 0        # the number of invalid timestamps
 
+# Global variables for validation
+trip_opd = {}                 # stores the EVENT_NO_TRIP and OPD_DATE values
+trip_meters = {}              # stores the EVENT_NO_TRIP and METERS values
+seen_trip_time = set()        # stores the EVENT_NO_TRIP and ACT_TIME values
+
 
 # Reset all statistics data structures
 def reset_daily_stats(date_str):
@@ -142,6 +157,88 @@ def print_summary(today):
         print(f'Duplicates       : {t.duplicates}')
         print(f'Missing          : {t.missing}')
         print(f'Status           : {status}')
+
+
+# Runs all validation assertions against a single breadcrumb record
+# Returns True if the record passes all validation assertions, False otherwise
+def validate_record(record):
+    violations = []
+    global trip_opd
+    global trip_meters
+    global seen_trip_time
+
+    # --- Assertion 1: GPS_LATITUDE must be non-null and in [-90, 90] (Limit) ---
+    lat = record.get("GPS_LATITUDE")
+    if lat is None or not (-90 <= lat <= 90):
+        violations.append("A1: GPS_LATITUDE is null or out of range [-90, 90]")
+
+    # --- Assertion 2: GPS_LONGITUDE must be non-null and in [-180, 180] (Limit) ---
+    lon = record.get("GPS_LONGITUDE")
+    if lon is None or not (-180 <= lon <= 180):
+        violations.append("A2: GPS_LONGITUDE is null or out of range [-180, 180]")
+
+    # --- Assertion 3: VEHICLE_ID must be non-null and not empty (Existence) ---
+    vid = record.get("VEHICLE_ID")
+    if not vid:
+      violations.append("A3: VEHICLE_ID is null or empty")
+
+    # --- Assertion 4: EVENT_NO_TRIP must be non-null and non-empty (Existence) ---
+    no_trip = record.get("EVENT_NO_TRIP")
+    if not no_trip:
+      violations.append("A4: EVENT_NO_TRIP is null or empty")
+
+    # --- Assertion 5: VEHICLE_ID must be 1-4 positive digits (0-9999) (Limit) ---
+    if vid < 0 or vid > 9999:
+      violations.append("A5: VEHICLE_ID is not 1 to 4 digits (0-9999)")
+
+    # --- Assertion 6: OPD_DATE must be between 1996-01-01 and today (inclusive) (Limit) ---
+    opd_lower = "01JAN1996:00:00:00"
+    opd_lower_date_time = datetime.strptime(opd_lower, "%d%b%Y:%H:%M:%S")
+
+    opd = record.get("OPD_DATE")
+    opd_date_time = datetime.strptime(opd,"%d%b%Y:%H:%M:%S")
+
+    if opd_date_time < opd_lower_date_time or opd_date_time > datetime.today():
+      violations.append("A6: OPD_DATE is not between 1996-01-01 and today")
+
+    # --- Assertion 7: Every non-null value in OPD_DATE must have a non-null value
+    #     in EVENT_NO_TRIP (Intra-record) ---
+    # opd = record.get("OPD_DATE") from assertion #6
+    # no_trip = record.get("EVENT_NO_TRIP") from assertion #4
+    if opd and not no_trip:
+      violations.append("A7: OPD_DATE is present but EVENT_NO_TRIP is null or empty.")
+
+    # --- Assertion 8: Every non-null value in ACT_TIME must have a non-null value
+	#     in EVENT_NO_STOP (Intra-record) ---
+    non_null_act = record.get("ACT_TIME")
+    non_null_event_stop = record.get("EVENT_NO_STOP")
+
+    if non_null_act and not non_null_event_stop:
+      violations.append("A8: ACT_TIME is present but EVENT_NO_STOP is null or empty.")
+
+    # --- Log and return result ---
+    if violations:
+        for msg in violations:
+            logging.warning("VALIDATION VIOLATION [%s] | record: %s", msg, record)
+        return False
+
+    return True
+
+
+# Writes accumulated invalid records to a file
+# invalid_records: a list of dictionaries containing a 'record' key (original data)
+#                  and a 'violations' key (a list of assertion violation messages)
+# run_date: a date string to be used in the file name; default is today (optional)
+def write_invalid_records(invalid_records, run_date=None):
+    if run_date is None:
+        run_date = date.today().isoformat()
+
+    filename = f"invalid_data_{run_date}.json"
+
+    with open(filename, "w") as f:
+        json.dump(invalid_records, f, indent=2, default=str)
+
+    print(f"Wrote {len(invalid_records)} invalid records to {filename}")
 
 
 def callback(message):
