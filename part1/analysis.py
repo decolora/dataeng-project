@@ -9,6 +9,7 @@ import os
 import sys
 import threading
 import time
+import json
 from datetime import datetime, date, timedelta
 
 import google.auth
@@ -104,10 +105,15 @@ unique_trips = set()          # the number of unique trips
 invalid_timestamps = 0        # the number of invalid timestamps
 
 # Global variables for validation
-trip_opd = {}                 # stores the EVENT_NO_TRIP and OPD_DATE values
-trip_meters = {}              # stores the EVENT_NO_TRIP and METERS values
-seen_trip_time = set()        # stores the EVENT_NO_TRIP and ACT_TIME values
+#trip_opd = {}                 # stores the EVENT_NO_TRIP and OPD_DATE values
+#trip_meters = {}              # stores the EVENT_NO_TRIP and METERS values
+#seen_trip_time = set()        # stores the EVENT_NO_TRIP and ACT_TIME values
 
+# Invalid records list
+invalid_records_list = []
+
+# A dict to keep track of the meters and seconds in the same EVENT_NO_TRIP
+trip_meter_sec = {}
 
 # Reset all statistics data structures
 def reset_daily_stats(date_str):
@@ -115,6 +121,10 @@ def reset_daily_stats(date_str):
     global first_msg_t, last_msg_t, latency_sum, latency_max
     global earliest_breadcrumb, latest_breadcrumb
     global unique_vehicle_ids, unique_trips, invalid_timestamps
+    global invalid_records_list
+    global trip_meter_sec
+
+
 
     runs.clear()
     deliveries = 0
@@ -129,6 +139,16 @@ def reset_daily_stats(date_str):
     unique_vehicle_ids.clear()
     unique_trips.clear()
     invalid_timestamps = 0
+
+    if invalid_records_list:
+        write_invalid_records(invalid_records_list, date_str) #writing the invalid data from previous day to a json file
+        invalid_records_list.clear()
+
+    trip_meter_sec.clear()
+    #trip_opd.clear()
+    #trip_meters.clear()
+    #seen_trip_time.clear()
+
     print(f"{date_str} — RESET ALL STATISTICS AND WAIT FOR THE NEW DAY.")
 
 
@@ -163,9 +183,9 @@ def print_summary(today):
 # Returns True if the record passes all validation assertions, False otherwise
 def validate_record(record):
     violations = []
-    global trip_opd
-    global trip_meters
-    global seen_trip_time
+   # global trip_opd
+   # global trip_meters
+   # global seen_trip_time
 
     # --- Assertion 1: GPS_LATITUDE must be non-null and in [-90, 90] (Limit) ---
     lat = record.get("GPS_LATITUDE")
@@ -220,9 +240,10 @@ def validate_record(record):
     if violations:
         for msg in violations:
             logging.warning("VALIDATION VIOLATION [%s] | record: %s", msg, record)
-        return False
+        return False, violations
 
-    return True
+    return True, []
+
 
 
 # Writes accumulated invalid records to a file
@@ -239,6 +260,73 @@ def write_invalid_records(invalid_records, run_date=None):
         json.dump(invalid_records, f, indent=2, default=str)
 
     print(f"Wrote {len(invalid_records)} invalid records to {filename}")
+
+
+# This is for section 5.2, 5.3, 5.4, 5.5
+def data_transformation(record):
+    speed = 0.0
+    global trip_meter_sec
+
+    # Section 5.2 - remove unneeded fields - EVENT_NO_STOP, GPS_SATELLITES, GPS_HDOP
+    record.pop("EVENT_NO_STOP", None)
+    record.pop("GPS_SATELLITES", None)
+    record.pop("GPS_HDOP", None)
+
+    # Section 5.3 - create a timestamp field
+    opd_date_string = record.get("OPD_DATE")
+    act_time_seconds = record.get("ACT_TIME")
+
+    if opd_date_string and act_time_seconds is not None:
+        try:
+            base_date = datetime.strptime(str(opd_date_string), "%d%b%Y:%H:%M:%S")
+            timestamp_field = base_date + timedelta(seconds=int(act_time_seconds))
+        except ValueError:
+            timestamp_field = None
+    else:
+        timestamp_field = None
+
+    # Section 5.4 - Create a speed field
+
+    event_no_trip = record.get("EVENT_NO_TRIP")
+    current_meters = record.get("METERS")
+
+    # If EVENT_NO_TRIP, timestamp and METERS are valid
+    if event_no_trip and timestamp_field and current_meters is not None:
+        if event_no_trip in trip_meter_sec:
+            previous_trip = trip_meter_sec[event_no_trip]
+            delta_meters = current_meters - previous_trip["meters"]
+            delta_seconds = (timestamp_field - previous_trip["timestamp"]).total_seconds()
+
+            #positive speed
+            if delta_seconds > 0:
+                speed = delta_meters / delta_seconds
+            else:
+                speed = 0.0
+
+    # Update the trip_meter_sec to the current meters and timestamp
+    trip_meter_sec[event_no_trip] = {"timestamp": timestamp_field, "meters": current_meters}
+
+    # Add the time and speed fields into the record
+    record["timestamp"] = timestamp_field.isoformat() if timestamp_field else None
+    record["speed"] = speed
+
+    # Remove the OPD_DATE and ACT_TIME fields
+    record.pop("OPD_DATE", None)
+    record.pop("ACT_TIME", None)
+
+    # Section 5.5 - Rename fields
+    # reference: https://www.w3tutorials.net/blog/renaming-the-keys-of-a-dictionary/
+
+    record["trip_id"] = record.pop("EVENT_NO_TRIP", None)
+    record["vehicle_id"] = record.pop("VEHICLE_ID", None)
+    record["longitude"] = record.pop("GPS_LONGITUDE", None)
+    record["latitude"] = record.pop("GPS_LATITUDE", None)
+
+    
+
+
+
+
 
 
 def callback(message):
@@ -272,6 +360,10 @@ def callback(message):
 
         if payload is None or not isinstance(payload, dict):
             bad_payloads += 1
+        else:
+            valid_record, violations = validate_record(payload)
+            if not valid_record:
+                invalid_records_list.append({"violations":violations, "record": payload})
 
         try:
             run_id, seq, expected_total = attrs['run_id'], int(attrs['seq']), int(attrs['total'])
