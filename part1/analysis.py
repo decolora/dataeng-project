@@ -15,6 +15,9 @@ import google.auth
 from google.cloud import pubsub_v1
 from google.cloud.pubsub_v1.types import FlowControl
 
+import psycopg2
+from psycopg2.extras import execute_batch
+
 # Configuration
 PROJECT_ID = 'dataeng-project-511022'
 SUBSCRIPTION_ID = 'analysis_sub'
@@ -31,6 +34,14 @@ logging.basicConfig(
 PDXAREA_LAT_MIN, PDX_AREA_LAT_MAX = 45.0, 46.0
 PDXAREA_LON_MIN, PDX_AREA_LON_MAX = -123.5, -122.0
 
+TABLE_NAME = "breadcrumb"       # table name for the database
+BATCH_SIZE = 1000               # number of records to insert in a single batch
+
+# Column names for the database table
+COLUMNS = [
+    "trip_id", "vehicle_id", "timestamp", "latitude",
+    "longitude", "speed", "meters"
+]
 
 # Check if the project ID exists
 def check_project_id(project_id=None):
@@ -105,6 +116,7 @@ invalid_timestamps = 0          # the number of invalid timestamps
 
 invalid_records_list = []       # the list of invalid records with violations
 trip_meter_sec = {}             # meters and seconds within same EVENT_NO_TRIP
+
 
 # Reset all statistics data structures
 def reset_daily_stats(date_str):
@@ -192,7 +204,7 @@ def validate_record(record):
       violations.append("A4: EVENT_NO_TRIP is null or empty")
 
     # --- Assertion 5: VEHICLE_ID must be 1-4 positive digits (0-9999) (Limit) ---
-    if vid < 0 or vid > 9999:
+    if vid is None or not (0 <= vid <= 9999):
       violations.append("A5: VEHICLE_ID is not 1 to 4 digits (0-9999)")
 
     # --- Assertion 6: OPD_DATE must be between 1996-01-01 and today (inclusive) (Limit) ---
@@ -227,7 +239,6 @@ def validate_record(record):
         return False, violations
 
     return True, []
-
 
 
 # Writes accumulated invalid records to a file
@@ -307,6 +318,61 @@ def data_transformation(record):
     record["longitude"] = record.pop("GPS_LONGITUDE", None)
     record["latitude"] = record.pop("GPS_LATITUDE", None)
 
+
+# Loads database credentials from a .env file
+def load_env(filepath=".env"):
+    if not os.path.exists(filepath):
+        return
+
+    with open(filepath) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.strip().split("=", 1)
+                os.environ[key] = value
+
+
+# Returns a psycopg2 connection for the database
+def get_connection():
+    try:
+        load_env(".env")
+    except Exception as e:
+        print(f"Error loading .env file: {e}")
+        return None
+
+    return psycopg2.connect(
+        host=os.getenv("DB_HOST"),
+        port=os.getenv("DB_PORT"),
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASS")
+    )
+
+
+# TODO: Prepares the SQL statement for inserting a record into the database
+def prepare_record(conn):
+    cur = conn.cursor()
+
+    cols = ', '.join(COLUMNS)
+    placeholders = ', '.join(['%s'] * len(COLUMNS))
+    cur.execute(f"""PREPARE insert_breadcrumb AS
+                    INSERT INTO {TABLE_NAME} ({cols}) VALUES ({placeholders})
+    """)
+
+    conn.commit()
+
+
+# TODO: Loads the transformed data into the database
+def load_record(conn, record):
+    cur = conn.cursor()
+    placeholders = ', '.join(['%s'] * len(COLUMNS))
+    values = [tuple(record.get(col) for col in COLUMNS)]
+
+    execute_batch("EXECUTE insert_breadcrumb ({placeholders})",
+                   values, page_size=BATCH_SIZE)
+    conn.commit()
+
+prepare_record(get_connection())    # prepare the SQL statement for inserting records
 
 def callback(message):
     global deliveries, untracked, bad_payloads, first_msg_t, last_msg_t
@@ -392,6 +458,17 @@ def callback(message):
             tracker.add(seq)
         else:
             untracked += 1
+        
+        # TODO: loads data into the database
+        conn = get_connection()
+        if conn:
+            try:
+                # transforms data before loading into the database
+                data_transformation(payload)
+                load_record(conn, payload)
+            except Exception as e:
+                print(f"Error loading record: {e}")
+        conn.close()
 
     # Ack even unparseable messages; they are counted above,
     # unacked would make Pub/Sub redeliver them forever
