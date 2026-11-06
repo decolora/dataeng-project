@@ -16,7 +16,7 @@ from google.cloud import pubsub_v1
 from google.cloud.pubsub_v1.types import FlowControl
 
 import psycopg2
-from psycopg2.extras import execute_batch
+from psycopg2.extras import execute_values
 
 # Configuration
 PROJECT_ID = 'dataeng-project-511022'
@@ -117,6 +117,7 @@ invalid_timestamps = 0          # the number of invalid timestamps
 invalid_records_list = []       # the list of invalid records with violations
 trip_meter_sec = {}             # meters and seconds within same EVENT_NO_TRIP
 
+conn = None                     # database connection
 
 # Reset all statistics data structures
 def reset_daily_stats(date_str):
@@ -196,33 +197,39 @@ def validate_record(record):
     # --- Assertion 3: VEHICLE_ID must be non-null and not empty (Existence) ---
     vid = record.get("VEHICLE_ID")
     if not vid:
-      violations.append("A3: VEHICLE_ID is null or empty")
+        violations.append("A3: VEHICLE_ID is null or empty")
 
     # --- Assertion 4: EVENT_NO_TRIP must be non-null and non-empty (Existence) ---
     no_trip = record.get("EVENT_NO_TRIP")
     if not no_trip:
-      violations.append("A4: EVENT_NO_TRIP is null or empty")
+        violations.append("A4: EVENT_NO_TRIP is null or empty")
 
     # --- Assertion 5: VEHICLE_ID must be 1-4 positive digits (0-9999) (Limit) ---
-    if vid is None or not (0 <= vid <= 9999):
-      violations.append("A5: VEHICLE_ID is not 1 to 4 digits (0-9999)")
+    if vid is None or not isinstance(vid, int) or not (0 <= vid <= 9999):
+        violations.append("A5: VEHICLE_ID is not 1 to 4 digits (0-9999)")
 
     # --- Assertion 6: OPD_DATE must be between 1996-01-01 and today (inclusive) (Limit) ---
     opd_lower = "01JAN1996:00:00:00"
     opd_lower_date_time = datetime.strptime(opd_lower, "%d%b%Y:%H:%M:%S")
 
     opd = record.get("OPD_DATE")
-    opd_date_time = datetime.strptime(opd,"%d%b%Y:%H:%M:%S")
+    opd_date_time = None
+    if opd:
+        try:
+            opd_date_time = datetime.strptime(str(opd), "%d%b%Y:%H:%M:%S")
+        except (ValueError, TypeError):
+            opd_date_time = None
 
-    if opd_date_time < opd_lower_date_time or opd_date_time > datetime.today():
-      violations.append("A6: OPD_DATE is not between 1996-01-01 and today")
+    if opd_date_time is None or opd_date_time < opd_lower_date_time or \
+       opd_date_time > datetime.today():
+        violations.append("A6: OPD_DATE is not between 1996-01-01 and today")
 
     # --- Assertion 7: Every non-null value in OPD_DATE must have a non-null value
     #     in EVENT_NO_TRIP (Intra-record) ---
     # opd = record.get("OPD_DATE") from assertion #6
     # no_trip = record.get("EVENT_NO_TRIP") from assertion #4
     if opd and not no_trip:
-      violations.append("A7: OPD_DATE is present but EVENT_NO_TRIP is null or empty.")
+        violations.append("A7: OPD_DATE is present but EVENT_NO_TRIP is null or empty.")
 
     # --- Assertion 8: Every non-null value in ACT_TIME must have a non-null value
 	#     in EVENT_NO_STOP (Intra-record) ---
@@ -230,7 +237,7 @@ def validate_record(record):
     non_null_event_stop = record.get("EVENT_NO_STOP")
 
     if non_null_act and not non_null_event_stop:
-      violations.append("A8: ACT_TIME is present but EVENT_NO_STOP is null or empty.")
+        violations.append("A8: ACT_TIME is present but EVENT_NO_STOP is null or empty.")
 
     # --- Log and return result ---
     if violations:
@@ -272,6 +279,7 @@ def data_transformation(record):
     opd_date_string = record.get("OPD_DATE")
     act_time_seconds = record.get("ACT_TIME")
 
+    timestamp = None
     if opd_date_string and act_time_seconds is not None:
         try:
             base_date = datetime.strptime(str(opd_date_string), "%d%b%Y:%H:%M:%S")
@@ -334,45 +342,34 @@ def load_env(filepath=".env"):
 
 # Returns a psycopg2 connection for the database
 def get_connection():
-    try:
-        load_env(".env")
-    except Exception as e:
-        print(f"Error loading .env file: {e}")
-        return None
-
-    return psycopg2.connect(
-        host=os.getenv("DB_HOST"),
-        port=os.getenv("DB_PORT"),
-        dbname=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASS")
-    )
-
-
-# TODO: Prepares the SQL statement for inserting a record into the database
-def prepare_record(conn):
-    cur = conn.cursor()
-
-    cols = ', '.join(COLUMNS)
-    placeholders = ', '.join(['%s'] * len(COLUMNS))
-    cur.execute(f"""PREPARE insert_breadcrumb AS
-                    INSERT INTO {TABLE_NAME} ({cols}) VALUES ({placeholders})
-    """)
-
-    conn.commit()
+    global conn
+    if conn is None or conn.closed != 0:
+        try:
+            load_env(".env")
+            conn = psycopg2.connect(
+                host=os.getenv("DB_HOST"),
+                port=os.getenv("DB_PORT"),
+                dbname=os.getenv("DB_NAME"),
+                user=os.getenv("DB_USER"),
+                password=os.getenv("DB_PASS")
+            )
+        except Exception as e:
+            logging.error(f"Error loading .env file: {e}")
+            conn = None
+    return conn
 
 
 # TODO: Loads the transformed data into the database
 def load_record(conn, record):
     cur = conn.cursor()
-    placeholders = ', '.join(['%s'] * len(COLUMNS))
+    cols = ', '.join(COLUMNS)
+    query = f"INSERT INTO {TABLE_NAME} ({cols}) VALUES %s"
     values = [tuple(record.get(col) for col in COLUMNS)]
 
-    execute_batch("EXECUTE insert_breadcrumb ({placeholders})",
-                   values, page_size=BATCH_SIZE)
+    execute_values(cur, query, values, page_size=BATCH_SIZE)
     conn.commit()
+    cur.close()
 
-prepare_record(get_connection())    # prepare the SQL statement for inserting records
 
 def callback(message):
     global deliveries, untracked, bad_payloads, first_msg_t, last_msg_t
@@ -420,21 +417,20 @@ def callback(message):
         # find the earliest and latest breadcrumb timestamps
         opd_date = payload.get('OPD_DATE') if payload else None
         act_time = payload.get('ACT_TIME') if payload else None
-        try:
-            base_date = datetime.strptime(str(opd_date), "%d%b%Y:%H:%M:%S")
-            breadcrumb_time = base_date + timedelta(seconds=int(act_time))
-            # if earliest_breadcrumb is empty, assign with new breadcrumb time
-            # otherwise, if the current breadcrumb_time is earlier, assign it
-            if (earliest_breadcrumb is None or breadcrumb_time < earliest_breadcrumb):
-                earliest_breadcrumb = breadcrumb_time
-            else:
+        if opd_date and act_time is not None:
+            try:
+                base_date = datetime.strptime(str(opd_date), "%d%b%Y:%H:%M:%S")
+                breadcrumb_time = base_date + timedelta(seconds=int(act_time))
+                # if earliest_breadcrumb is empty, assign with new breadcrumb time
+                # otherwise, if the current breadcrumb_time is earlier, assign it
+                if (earliest_breadcrumb is None or breadcrumb_time < earliest_breadcrumb):
+                    earliest_breadcrumb = breadcrumb_time
+                # check the latest breadcrumb time
+                if (latest_breadcrumb is None or breadcrumb_time > latest_breadcrumb):
+                    latest_breadcrumb = breadcrumb_time
+            except ValueError:
                 invalid_timestamps += 1
-            # check the latest breadcrumb time
-            if (latest_breadcrumb is None or breadcrumb_time > latest_breadcrumb):
-                latest_breadcrumb = breadcrumb_time
-            else:
-                invalid_timestamps += 1
-        except ValueError:
+        else:
             invalid_timestamps += 1
 
         # check the unique vehicle_ids
@@ -460,23 +456,27 @@ def callback(message):
             untracked += 1
         
         # TODO: loads data into the database
-        conn = get_connection()
-        if conn:
-            try:
-                # transforms data before loading into the database
-                data_transformation(payload)
-                load_record(conn, payload)
-            except Exception as e:
-                print(f"Error loading record: {e}")
-        conn.close()
+        if isinstance(payload, dict) and valid_record:
+            conn = get_connection()
+            if conn:
+                try:
+                    # transforms data before loading into the database
+                    data_transformation(payload)
+                    load_record(conn, payload)
+                except Exception as e:
+                    logging.error(f"Error loading record: {e}")
+                    try:
+                        conn.rollback()
+                    except Exception as r:
+                        logging.error(f"Error rolling back transaction: {r}")
 
-    # Ack even unparseable messages; they are counted above,
-    # unacked would make Pub/Sub redeliver them forever
-    message.ack()
+        # Ack even unparseable messages; they are counted above,
+        # unacked would make Pub/Sub redeliver them forever
+        message.ack()
 
 
-def all_runs_complete():
-    return bool(runs) and all(t.missing == 0 for t in runs.values())
+    def all_runs_complete():
+        return bool(runs) and all(t.missing == 0 for t in runs.values())
 
 
 print(f'Listening on subscription: {SUBSCRIPTION_ID}')
