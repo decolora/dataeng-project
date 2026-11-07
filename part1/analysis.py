@@ -119,6 +119,7 @@ trip_meter_sec = {}             # meters and seconds within same EVENT_NO_TRIP
 
 conn = None                     # database connection
 batch_buffer = []               # buffer for batch inserts
+stored = 0                      # the number of records successfully inserted
 
 
 # Reset all statistics data structures
@@ -129,6 +130,7 @@ def reset_daily_stats(date_str):
     global unique_vehicle_ids, unique_trips, invalid_timestamps
     global invalid_records_list
     global trip_meter_sec
+    global stored
 
     # flushes any remaining records in the batch buffer
     flush_record()
@@ -146,6 +148,7 @@ def reset_daily_stats(date_str):
     unique_vehicle_ids.clear()
     unique_trips.clear()
     invalid_timestamps = 0
+    stored = 0
 
     if invalid_records_list:
         # writes the invalid data from previous day to a json file
@@ -173,6 +176,7 @@ def print_summary(today):
     print(f'Latest breadcrumb  : {latest_breadcrumb}')
     print(f'Unique vehicle IDs : {len(unique_vehicle_ids)}')
     print(f'Unique trips       : {len(unique_trips)}')
+    print(f'Stored records     : {stored}')
 
     for run_id, t in runs.items():
         status = 'COMPLETE' if t.missing == 0 else 'INCOMPLETE'
@@ -395,11 +399,13 @@ def flush_record():
 # TODO: Loads the transformed data into the database
 def load_record(record):
     global batch_buffer
+    global stored
     values = tuple(record.get(col) for col in COLUMNS)
     should_flush = False
 
     with lock:
         batch_buffer.append(values)
+        stored += 1
         if len(batch_buffer) >= BATCH_SIZE:
             should_flush = True
 
