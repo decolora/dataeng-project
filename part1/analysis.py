@@ -23,7 +23,7 @@ PROJECT_ID = 'dataeng-project-511022'
 SUBSCRIPTION_ID = 'analysis_sub'
 
 # How many messages can be held unacknowledged at once
-flow_control = FlowControl(max_messages=1000)
+flow_control = FlowControl(max_messages=10000)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -118,6 +118,8 @@ invalid_records_list = []       # the list of invalid records with violations
 trip_meter_sec = {}             # meters and seconds within same EVENT_NO_TRIP
 
 conn = None                     # database connection
+batch_buffer = []               # buffer for batch inserts
+
 
 # Reset all statistics data structures
 def reset_daily_stats(date_str):
@@ -127,6 +129,9 @@ def reset_daily_stats(date_str):
     global unique_vehicle_ids, unique_trips, invalid_timestamps
     global invalid_records_list
     global trip_meter_sec
+
+    # flushes any remaining records in the batch buffer
+    flush_record()
 
     runs.clear()
     deliveries = 0
@@ -241,8 +246,8 @@ def validate_record(record):
 
     # --- Log and return result ---
     if violations:
-        for msg in violations:
-            logging.warning("VALIDATION VIOLATION [%s] | record: %s", msg, record)
+        # for msg in violations:
+            # logging.warning("VALIDATION VIOLATION [%s] | record: %s", msg, record)
         return False, violations
 
     return True, []
@@ -359,23 +364,54 @@ def get_connection():
     return conn
 
 
-# TODO: Loads the transformed data into the database
-def load_record(conn, record):
-    cur = conn.cursor()
-    cols = ', '.join(COLUMNS)
-    query = f"INSERT INTO {TABLE_NAME} ({cols}) VALUES %s"
-    values = [tuple(record.get(col) for col in COLUMNS)]
+# Flushes the batch buffer; batch buffer holds BATCH_SIZE records
+def flush_record():
+    global batch_buffer
+    to_insert = []
 
-    execute_values(cur, query, values, page_size=BATCH_SIZE)
-    conn.commit()
-    cur.close()
+    with lock:
+        if not batch_buffer:
+            return
+        to_insert = batch_buffer
+        batch_buffer = []
+
+    # executes the batch insert outside of lock
+    conn = get_connection()
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cols = ', '.join(COLUMNS)
+                query = f"INSERT INTO {TABLE_NAME} ({cols}) VALUES %s"
+                execute_values(cur, query, to_insert, page_size=BATCH_SIZE)
+            conn.commit()
+        except Exception as e:
+            logging.error(f"Error flushing records to database: {e}")
+            try:
+                conn.rollback()
+            except Exception as r:
+                logging.error(f"Error rolling back transaction: {r}")
+
+
+# TODO: Loads the transformed data into the database
+def load_record(record):
+    global batch_buffer
+    values = tuple(record.get(col) for col in COLUMNS)
+    should_flush = False
+
+    with lock:
+        batch_buffer.append(values)
+        if len(batch_buffer) >= BATCH_SIZE:
+            should_flush = True
+
+    if should_flush:
+        flush_record()
 
 
 def callback(message):
     global deliveries, untracked, bad_payloads, first_msg_t, last_msg_t
     global latency_sum, latency_max
     global earliest_breadcrumb, latest_breadcrumb
-    global invalid_timestamps, current_date, prev_date
+    global invalid_timestamps, prev_date
     now = time.time()
     today = datetime.now().strftime("%Y%m%d")
 
@@ -385,6 +421,8 @@ def callback(message):
         payload = None
     latency = now - message.publish_time.timestamp()
     attrs = message.attributes
+
+    valid_to_load = False
 
     with lock:
         # check if it is a new day, reset and show new statistics
@@ -455,28 +493,25 @@ def callback(message):
         else:
             untracked += 1
         
-        # TODO: loads data into the database
+        # TODO: transforms data before loading into the database
         if isinstance(payload, dict) and valid_record:
-            conn = get_connection()
-            if conn:
                 try:
-                    # transforms data before loading into the database
                     data_transformation(payload)
-                    load_record(conn, payload)
+                    valid_to_load = True
                 except Exception as e:
-                    logging.error(f"Error loading record: {e}")
-                    try:
-                        conn.rollback()
-                    except Exception as r:
-                        logging.error(f"Error rolling back transaction: {r}")
+                    logging.error(f"Error transforming record: {e}")
 
-        # Ack even unparseable messages; they are counted above,
-        # unacked would make Pub/Sub redeliver them forever
-        message.ack()
+    # loads database outside of lock to avoid blocking other threads
+    if valid_to_load:
+        load_record(payload)
+
+    # Ack even unparseable messages; they are counted above,
+    # unacked would make Pub/Sub redeliver them forever
+    message.ack()
 
 
-    def all_runs_complete():
-        return bool(runs) and all(t.missing == 0 for t in runs.values())
+def all_runs_complete():
+    return bool(runs) and all(t.missing == 0 for t in runs.values())
 
 
 print(f'Listening on subscription: {SUBSCRIPTION_ID}')
@@ -495,8 +530,23 @@ with subscriber:
     except Exception as e:
         print(f"Error encountered: {e}. Program stopped!")
 
+flush_record()  # flush any remaining records in the batch buffer
+
+if conn and conn.closed == 0:
+    try:
+        conn.close()
+    except Exception as e:
+        logging.error(f"Error closing connection: {e}")
+        try:
+            conn.rollback()
+        except Exception as r:
+            logging.error(f"Error rolling back transaction: {r}")
+
 elapsed = time.time() - start_time
 active = (last_msg_t - first_msg_t) if first_msg_t else 0.0
 
 summary_date = prev_date or datetime.now().strftime("%Y%m%d")
+
+if invalid_records_list:
+    write_invalid_records(invalid_records_list, summary_date)
 print_summary(summary_date)
