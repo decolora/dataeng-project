@@ -6,6 +6,7 @@
 import json
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -520,11 +521,45 @@ def all_runs_complete():
     return bool(runs) and all(t.missing == 0 for t in runs.values())
 
 
+# Handles the shutdown if VM/systemd stops
+def handle_shutdown(signum, frame):
+    global elapsed, active
+    print(f"Shutdown signal ({signum}) received. Writing summary...")
+
+    flush_record()  # flush any remaining records in the batch buffer
+
+    if conn and conn.closed == 0:
+        try:
+            conn.close()
+        except Exception as e:
+            logging.error(f"Error closing connection: {e}")
+            try:
+                conn.rollback()
+            except Exception as r:
+                logging.error(f"Error rolling back transaction: {r}")
+
+    elapsed = time.time() - start_time
+    active = (last_msg_t - first_msg_t) if first_msg_t else 0.0
+
+    summary_date = prev_date or datetime.now().strftime("%Y%m%d")
+
+    if invalid_records_list:
+        write_invalid_records(invalid_records_list, summary_date)
+    print_summary(summary_date)
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, handle_shutdown)
+signal.signal(signal.SIGTERM, handle_shutdown)
+
 print(f'Listening on subscription: {SUBSCRIPTION_ID}')
+sys.stdout.flush()
 
 streaming_pull = subscriber.subscribe(sub_path, callback=callback,
                                       flow_control=flow_control,
-                                      await_callbacks_on_shutdown=True)
+                                      await_callbacks_on_shutdown=False)
 
 with subscriber:
     try:
@@ -535,6 +570,8 @@ with subscriber:
         print("Service stopped by the user!")
     except Exception as e:
         print(f"Error encountered: {e}. Program stopped!")
+        sys.stdout.flush()
+        sys.stderr.flush()
 
 flush_record()  # flush any remaining records in the batch buffer
 
