@@ -4,9 +4,7 @@
 # Usage: python3 analysis.py analysis_sub
 
 import json
-import logging
 import os
-import signal
 import sys
 import threading
 import time
@@ -16,33 +14,13 @@ import google.auth
 from google.cloud import pubsub_v1
 from google.cloud.pubsub_v1.types import FlowControl
 
-import psycopg2
-from psycopg2.extras import execute_values
-
 # Configuration
 PROJECT_ID = 'dataeng-project-511022'
 SUBSCRIPTION_ID = 'analysis_sub'
 
 # How many messages can be held unacknowledged at once
-flow_control = FlowControl(max_messages=10000)
+flow_control = FlowControl(max_messages=1000)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-
-# Portland area boundaries
-PDXAREA_LAT_MIN, PDX_AREA_LAT_MAX = 45.0, 46.0
-PDXAREA_LON_MIN, PDX_AREA_LON_MAX = -123.5, -122.0
-
-TABLE_NAME = "breadcrumb"       # table name for the database
-BATCH_SIZE = 1000               # number of records to insert in a single batch
-
-# Column names for the database table
-COLUMNS = [
-    "trip_id", "vehicle_id", "timestamp", "latitude",
-    "longitude", "speed", "meters"
-]
 
 # Check if the project ID exists
 def check_project_id(project_id=None):
@@ -57,10 +35,10 @@ def check_project_id(project_id=None):
 # Tracks one publisher run with a bitmap: 1 bit per record
 class RunTracker:
     def __init__(self, total):
-        self.total = total      # total of breadcrumbs received
+        self.total = total    # total of breadcrumbs received
         self.seen = bytearray((total + 7) // 8)
-        self.unique = 0         # the number of unique vehicles
-        self.duplicates = 0     # any number of duplicates
+        self.unique = 0       # the number of unique vehicles
+        self.duplicates = 0   # any number of duplicates
 
     def add(self, seq):
         byte, bit = divmod(seq, 8)
@@ -96,31 +74,24 @@ subscriber.get_subscription(subscription=sub_path)
 
 # Shared state
 lock = threading.Lock()
-runs = {}                       # run_id -> RunTracker
-deliveries = 0                  # every call
-untracked = 0                   # messages without valid run_id/seq attributes
-bad_payloads = 0                # messages whose data is not valid JSON
+runs = {}                     # run_id -> RunTracker
+deliveries = 0                # every call
+untracked = 0                 # messages without valid run_id/seq attributes
+bad_payloads = 0              # messages whose data is not valid JSON
 prev_date = None
 first_msg_t = None
 last_msg_t = None
-latency_sum = 0.0               # publish -> receive, from Pub/Sub's publish_time
+latency_sum = 0.0             # publish -> receive, from Pub/Sub's publish_time
 latency_max = 0.0
 start_time = time.time()
 elapsed = 0.0
 active = 0.0
 
-earliest_breadcrumb = None      # the breadcrumb at the earliest time
-latest_breadcrumb = None        # the breadcrumb at the latest time
-unique_vehicle_ids = set()      # the number of unique vehicle IDs
-unique_trips = set()            # the number of unique trips
-invalid_timestamps = 0          # the number of invalid timestamps
-
-invalid_records_list = []       # the list of invalid records with violations
-trip_meter_sec = {}             # meters and seconds within same EVENT_NO_TRIP
-
-conn = None                     # database connection
-batch_buffer = []               # buffer for batch inserts
-stored = 0                      # the number of records successfully inserted
+earliest_breadcrumb = None    # the breadcrumb at the earliest time
+latest_breadcrumb = None      # the breadcrumb at the latest time
+unique_vehicle_ids = set()    # the number of unique vehicle IDs
+unique_trips = set()          # the number of unique trips
+invalid_timestamps = 0        # the number of invalid timestamps
 
 
 # Reset all statistics data structures
@@ -129,12 +100,6 @@ def reset_daily_stats(date_str):
     global first_msg_t, last_msg_t, latency_sum, latency_max
     global earliest_breadcrumb, latest_breadcrumb
     global unique_vehicle_ids, unique_trips, invalid_timestamps
-    global invalid_records_list
-    global trip_meter_sec
-    global stored
-
-    # flushes any remaining records in the batch buffer
-    flush_record()
 
     runs.clear()
     deliveries = 0
@@ -149,15 +114,6 @@ def reset_daily_stats(date_str):
     unique_vehicle_ids.clear()
     unique_trips.clear()
     invalid_timestamps = 0
-    stored = 0
-
-    if invalid_records_list:
-        # writes the invalid data from previous day to a json file
-        write_invalid_records(invalid_records_list, date_str)
-        invalid_records_list.clear()
-
-    trip_meter_sec.clear()
-
     print(f"{date_str} — RESET ALL STATISTICS AND WAIT FOR THE NEW DAY.")
 
 
@@ -177,7 +133,6 @@ def print_summary(today):
     print(f'Latest breadcrumb  : {latest_breadcrumb}')
     print(f'Unique vehicle IDs : {len(unique_vehicle_ids)}')
     print(f'Unique trips       : {len(unique_trips)}')
-    print(f'Stored records     : {stored}')
 
     for run_id, t in runs.items():
         status = 'COMPLETE' if t.missing == 0 else 'INCOMPLETE'
@@ -189,236 +144,11 @@ def print_summary(today):
         print(f'Status           : {status}')
 
 
-# Runs all validation assertions against a single breadcrumb record
-# Returns True if the record passes all validation assertions, False otherwise
-def validate_record(record):
-    violations = []
-
-    # --- Assertion 1: GPS_LATITUDE must be non-null and in [-90, 90] (Limit) ---
-    lat = record.get("GPS_LATITUDE")
-    if lat is None or not (-90 <= lat <= 90):
-        violations.append("A1: GPS_LATITUDE is null or out of range [-90, 90]")
-
-    # --- Assertion 2: GPS_LONGITUDE must be non-null and in [-180, 180] (Limit) ---
-    lon = record.get("GPS_LONGITUDE")
-    if lon is None or not (-180 <= lon <= 180):
-        violations.append("A2: GPS_LONGITUDE is null or out of range [-180, 180]")
-
-    # --- Assertion 3: VEHICLE_ID must be non-null and not empty (Existence) ---
-    vid = record.get("VEHICLE_ID")
-    if not vid:
-        violations.append("A3: VEHICLE_ID is null or empty")
-
-    # --- Assertion 4: EVENT_NO_TRIP must be non-null and non-empty (Existence) ---
-    no_trip = record.get("EVENT_NO_TRIP")
-    if not no_trip:
-        violations.append("A4: EVENT_NO_TRIP is null or empty")
-
-    # --- Assertion 5: VEHICLE_ID must be 1-4 positive digits (0-9999) (Limit) ---
-    if vid is None or not isinstance(vid, int) or not (0 <= vid <= 9999):
-        violations.append("A5: VEHICLE_ID is not 1 to 4 digits (0-9999)")
-
-    # --- Assertion 6: OPD_DATE must be between 1996-01-01 and today (inclusive) (Limit) ---
-    opd_lower = "01JAN1996:00:00:00"
-    opd_lower_date_time = datetime.strptime(opd_lower, "%d%b%Y:%H:%M:%S")
-
-    opd = record.get("OPD_DATE")
-    opd_date_time = None
-    if opd:
-        try:
-            opd_date_time = datetime.strptime(str(opd), "%d%b%Y:%H:%M:%S")
-        except (ValueError, TypeError):
-            opd_date_time = None
-
-    if opd_date_time is None or opd_date_time < opd_lower_date_time or \
-       opd_date_time > datetime.today():
-        violations.append("A6: OPD_DATE is not between 1996-01-01 and today")
-
-    # --- Assertion 7: Every non-null value in OPD_DATE must have a non-null value
-    #     in EVENT_NO_TRIP (Intra-record) ---
-    # opd = record.get("OPD_DATE") from assertion #6
-    # no_trip = record.get("EVENT_NO_TRIP") from assertion #4
-    if opd and not no_trip:
-        violations.append("A7: OPD_DATE is present but EVENT_NO_TRIP is null or empty.")
-
-    # --- Assertion 8: Every non-null value in ACT_TIME must have a non-null value
-	#     in EVENT_NO_STOP (Intra-record) ---
-    non_null_act = record.get("ACT_TIME")
-    non_null_event_stop = record.get("EVENT_NO_STOP")
-
-    if non_null_act and not non_null_event_stop:
-        violations.append("A8: ACT_TIME is present but EVENT_NO_STOP is null or empty.")
-
-    # --- Log and return result ---
-    if violations:
-        # for msg in violations:
-            # logging.warning("VALIDATION VIOLATION [%s] | record: %s", msg, record)
-        return False, violations
-
-    return True, []
-
-
-# Writes accumulated invalid records to a file
-# invalid_records: a list of dictionaries containing a 'record' key (original data)
-#                  and a 'violations' key (a list of assertion violation messages)
-# run_date: a date string to be used in the file name; default is today (optional)
-def write_invalid_records(invalid_records, run_date=None):
-    if run_date is None:
-        run_date = date.today().isoformat()
-
-    filename = f"invalid_data_{run_date}.json"
-
-    with open(filename, "w") as f:
-        json.dump(invalid_records, f, indent=2, default=str)
-
-    print(f"Wrote {len(invalid_records)} invalid records to {filename}")
-
-
-# Transforms the record by removing unneeded fields, creating a timestamp field,
-# creating a speed field, and renaming fields.
-def data_transformation(record):
-    speed = 0.0
-    global trip_meter_sec
-
-    # Section 5.2 - remove unneeded fields
-    record.pop("EVENT_NO_STOP", None)
-    record.pop("GPS_SATELLITES", None)
-    record.pop("GPS_HDOP", None)
-
-    # Section 5.3 - create a timestamp field
-    opd_date_string = record.get("OPD_DATE")
-    act_time_seconds = record.get("ACT_TIME")
-
-    timestamp = None
-    if opd_date_string and act_time_seconds is not None:
-        try:
-            base_date = datetime.strptime(str(opd_date_string), "%d%b%Y:%H:%M:%S")
-            timestamp = base_date + timedelta(seconds=int(act_time_seconds))
-        except ValueError:
-            timestamp = None
-    else:
-        timestamp = None
-
-    # Section 5.4 - create a speed field
-    event_no_trip = record.get("EVENT_NO_TRIP")
-    current_meters = record.get("METERS")
-
-    # If EVENT_NO_TRIP, timestamp and METERS are valid
-    if event_no_trip and timestamp and current_meters is not None:
-        if event_no_trip in trip_meter_sec:
-            previous_trip = trip_meter_sec[event_no_trip]
-            delta_meters = current_meters - previous_trip["meters"]
-            delta_seconds = (timestamp - previous_trip["timestamp"]).total_seconds()
-
-            # positive speed
-            if delta_seconds > 0:
-                speed = delta_meters / delta_seconds
-            # the first breadcrumb of each trip has a speed of 0.0
-            else:
-                speed = 0.0
-
-    # update the trip_meter_sec to the current meters and timestamp
-    trip_meter_sec[event_no_trip] = {"timestamp": timestamp, "meters": current_meters}
-
-    # add the time and speed fields into the record
-    record["timestamp"] = timestamp.isoformat() if timestamp else None
-    record["speed"] = speed
-
-    # remove the OPD_DATE and ACT_TIME fields
-    record.pop("OPD_DATE", None)
-    record.pop("ACT_TIME", None)
-
-    # Section 5.5 - rename fields
-    # reference: https://www.w3tutorials.net/blog/renaming-the-keys-of-a-dictionary/
-
-    record["trip_id"] = record.pop("EVENT_NO_TRIP", None)
-    record["vehicle_id"] = record.pop("VEHICLE_ID", None)
-    record["longitude"] = record.pop("GPS_LONGITUDE", None)
-    record["latitude"] = record.pop("GPS_LATITUDE", None)
-
-
-# Loads database credentials from a .env file
-def load_env(filepath=".env"):
-    if not os.path.exists(filepath):
-        return
-
-    with open(filepath) as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, value = line.strip().split("=", 1)
-                os.environ[key] = value
-
-
-# Returns a psycopg2 connection for the database
-def get_connection():
-    global conn
-    if conn is None or conn.closed != 0:
-        try:
-            load_env(".env")
-            conn = psycopg2.connect(
-                host=os.getenv("DB_HOST"),
-                port=os.getenv("DB_PORT"),
-                dbname=os.getenv("DB_NAME"),
-                user=os.getenv("DB_USER"),
-                password=os.getenv("DB_PASS")
-            )
-        except Exception as e:
-            logging.error(f"Error loading .env file: {e}")
-            conn = None
-    return conn
-
-
-# Flushes the batch buffer; batch buffer holds BATCH_SIZE records
-def flush_record():
-    global batch_buffer
-    to_insert = []
-
-    with lock:
-        if not batch_buffer:
-            return
-        to_insert = batch_buffer
-        batch_buffer = []
-
-    # executes the batch insert outside of lock
-    conn = get_connection()
-    if conn:
-        try:
-            with conn.cursor() as cur:
-                cols = ', '.join(COLUMNS)
-                query = f"INSERT INTO {TABLE_NAME} ({cols}) VALUES %s"
-                execute_values(cur, query, to_insert, page_size=BATCH_SIZE)
-            conn.commit()
-        except Exception as e:
-            logging.error(f"Error flushing records to database: {e}")
-            try:
-                conn.rollback()
-            except Exception as r:
-                logging.error(f"Error rolling back transaction: {r}")
-
-
-# TODO: Loads the transformed data into the database
-def load_record(record):
-    global batch_buffer
-    global stored
-    values = tuple(record.get(col) for col in COLUMNS)
-    should_flush = False
-
-    with lock:
-        batch_buffer.append(values)
-        stored += 1
-        if len(batch_buffer) >= BATCH_SIZE:
-            should_flush = True
-
-    if should_flush:
-        flush_record()
-
-
 def callback(message):
     global deliveries, untracked, bad_payloads, first_msg_t, last_msg_t
     global latency_sum, latency_max
     global earliest_breadcrumb, latest_breadcrumb
-    global invalid_timestamps, prev_date
+    global invalid_timestamps, current_date, prev_date
     now = time.time()
     today = datetime.now().strftime("%Y%m%d")
 
@@ -428,8 +158,6 @@ def callback(message):
         payload = None
     latency = now - message.publish_time.timestamp()
     attrs = message.attributes
-
-    valid_to_load = False
 
     with lock:
         # check if it is a new day, reset and show new statistics
@@ -447,10 +175,6 @@ def callback(message):
 
         if payload is None or not isinstance(payload, dict):
             bad_payloads += 1
-        else:
-            valid_record, violations = validate_record(payload)
-            if not valid_record:
-                invalid_records_list.append({"violations": violations, "record": payload})
 
         try:
             run_id, seq, expected_total = attrs['run_id'], int(attrs['seq']), int(attrs['total'])
@@ -462,20 +186,21 @@ def callback(message):
         # find the earliest and latest breadcrumb timestamps
         opd_date = payload.get('OPD_DATE') if payload else None
         act_time = payload.get('ACT_TIME') if payload else None
-        if opd_date and act_time is not None:
-            try:
-                base_date = datetime.strptime(str(opd_date), "%d%b%Y:%H:%M:%S")
-                breadcrumb_time = base_date + timedelta(seconds=int(act_time))
-                # if earliest_breadcrumb is empty, assign with new breadcrumb time
-                # otherwise, if the current breadcrumb_time is earlier, assign it
-                if (earliest_breadcrumb is None or breadcrumb_time < earliest_breadcrumb):
-                    earliest_breadcrumb = breadcrumb_time
-                # check the latest breadcrumb time
-                if (latest_breadcrumb is None or breadcrumb_time > latest_breadcrumb):
-                    latest_breadcrumb = breadcrumb_time
-            except ValueError:
+        try:
+            base_date = datetime.strptime(str(opd_date), "%d%b%Y:%H:%M:%S")
+            breadcrumb_time = base_date + timedelta(seconds=int(act_time))
+            # if earliest_breadcrumb is empty, assign with new breadcrumb time
+            # otherwise, if the current breadcrumb_time is earlier, assign it
+            if (earliest_breadcrumb is None or breadcrumb_time < earliest_breadcrumb):
+                earliest_breadcrumb = breadcrumb_time
+            else:
                 invalid_timestamps += 1
-        else:
+            # check the latest breadcrumb time
+            if (latest_breadcrumb is None or breadcrumb_time > latest_breadcrumb):
+                latest_breadcrumb = breadcrumb_time
+            else:
+                invalid_timestamps += 1
+        except ValueError:
             invalid_timestamps += 1
 
         # check the unique vehicle_ids
@@ -499,18 +224,6 @@ def callback(message):
             tracker.add(seq)
         else:
             untracked += 1
-        
-        # TODO: transforms data before loading into the database
-        if isinstance(payload, dict) and valid_record:
-                try:
-                    data_transformation(payload)
-                    valid_to_load = True
-                except Exception as e:
-                    logging.error(f"Error transforming record: {e}")
-
-    # loads database outside of lock to avoid blocking other threads
-    if valid_to_load:
-        load_record(payload)
 
     # Ack even unparseable messages; they are counted above,
     # unacked would make Pub/Sub redeliver them forever
@@ -521,45 +234,11 @@ def all_runs_complete():
     return bool(runs) and all(t.missing == 0 for t in runs.values())
 
 
-# Handles the shutdown if VM/systemd stops
-def handle_shutdown(signum, frame):
-    global elapsed, active
-    print(f"Shutdown signal ({signum}) received. Writing summary...")
-
-    flush_record()  # flush any remaining records in the batch buffer
-
-    if conn and conn.closed == 0:
-        try:
-            conn.close()
-        except Exception as e:
-            logging.error(f"Error closing connection: {e}")
-            try:
-                conn.rollback()
-            except Exception as r:
-                logging.error(f"Error rolling back transaction: {r}")
-
-    elapsed = time.time() - start_time
-    active = (last_msg_t - first_msg_t) if first_msg_t else 0.0
-
-    summary_date = prev_date or datetime.now().strftime("%Y%m%d")
-
-    if invalid_records_list:
-        write_invalid_records(invalid_records_list, summary_date)
-    print_summary(summary_date)
-
-    sys.stdout.flush()
-    sys.stderr.flush()
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, handle_shutdown)
-signal.signal(signal.SIGTERM, handle_shutdown)
-
 print(f'Listening on subscription: {SUBSCRIPTION_ID}')
-sys.stdout.flush()
 
 streaming_pull = subscriber.subscribe(sub_path, callback=callback,
                                       flow_control=flow_control,
-                                      await_callbacks_on_shutdown=False)
+                                      await_callbacks_on_shutdown=True)
 
 with subscriber:
     try:
@@ -570,26 +249,9 @@ with subscriber:
         print("Service stopped by the user!")
     except Exception as e:
         print(f"Error encountered: {e}. Program stopped!")
-        sys.stdout.flush()
-        sys.stderr.flush()
-
-flush_record()  # flush any remaining records in the batch buffer
-
-if conn and conn.closed == 0:
-    try:
-        conn.close()
-    except Exception as e:
-        logging.error(f"Error closing connection: {e}")
-        try:
-            conn.rollback()
-        except Exception as r:
-            logging.error(f"Error rolling back transaction: {r}")
 
 elapsed = time.time() - start_time
 active = (last_msg_t - first_msg_t) if first_msg_t else 0.0
 
 summary_date = prev_date or datetime.now().strftime("%Y%m%d")
-
-if invalid_records_list:
-    write_invalid_records(invalid_records_list, summary_date)
 print_summary(summary_date)
