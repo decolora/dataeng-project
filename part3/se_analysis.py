@@ -264,8 +264,7 @@ def _sec_to_timestamp(seconds_value, base_date):
 # Transforms the arrive_time, stop_time, leave_time into timestamps
 # and add them into the base service_date
 # The service_date in this case is the today's date
-def time_fields_to_timestamps (arrive_t, stop_t, leave_t):
-    service_date = date.today()
+def time_fields_to_timestamps (service_date, arrive_t, stop_t, leave_t):
     arrive_seconds = _sec_to_timestamp(arrive_t, service_date)
     stop_seconds = _sec_to_timestamp(stop_t, service_date)
     leave_seconds = _sec_to_timestamp(leave_t, service_date)
@@ -414,6 +413,7 @@ def callback(message):
         if isinstance(payload, dict) and valid_record:
                 try:
                     arrive_ts, stop_ts, leave_ts = time_fields_to_timestamps(
+                        payload.get("service_date"),
                         payload.get("arrive_time"),
                         payload.get("stop_time"),
                         payload.get("leave_time")

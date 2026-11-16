@@ -99,8 +99,11 @@ published = 0
 total = 0
 start = time.time()
 last_progress = start
-trip_num_pattern = r"Stop events for PDX_TRIP (?P<trip_num>\d+)"
 unique_stop_events = set()
+
+# Regex patterns to extract service date and trip number from HTML response
+service_date_pattern = r"Trimet CAD/AVL stop date for (\d{4}-\d{2}-\d{2})"
+trip_num_pattern = r"Stop events for PDX_TRIP (\d+)"
 
 # Process all vehicle IDs
 for vid in VEHICLE_IDS:
@@ -111,6 +114,15 @@ for vid in VEHICLE_IDS:
         data = BeautifulSoup(resp.text, 'html.parser')
         time.sleep(0.1)
 
+        # find the servide date in the response
+        h1_tag = data.find('h1')
+        service_date = None
+        if h1_tag:
+            service_date_match = re.search(service_date_pattern,
+                                           h1_tag.get_text(strip=True))
+            if service_date_match:
+                service_date = service_date_match.group(1)
+
         # find the trip headings in the response
         h2_tags = data.find_all('h2')
 
@@ -119,7 +131,8 @@ for vid in VEHICLE_IDS:
             trip_match = re.search(trip_num_pattern, tag.get_text(strip=True))
             if trip_match is None:
                 continue
-            trip_num = trip_match.group('trip_num')
+            service_date = service_date
+            trip_num = trip_match.group(1)
             unique_stop_events.add(trip_num)
 
             # find the table associated with the trip number
