@@ -21,7 +21,7 @@ PROJECT_ID = 'dataeng-project-511022'
 SUBSCRIPTION_ID = 'backup_sub'
 
 # How many messages can be held unacknowledged at once
-flow_control = FlowControl(max_messages=1000)
+flow_control = FlowControl(max_messages=10000)
 
 
 # Check if the project ID exists
@@ -120,7 +120,8 @@ def reset_daily_stats(date_str):
     invalid_timestamps = 0
     print(f"{date_str} — RESET ALL STATISTICS AND WAIT FOR THE NEW DAY.")
 
-# Logging
+
+# Creates a new daily backup file
 def create_daily_backup():
     filename = f'breadcrumbs_{date.today():%Y-%m-%d}_.log'
     return filename, open(filename, 'a', encoding='utf-8')
@@ -175,7 +176,7 @@ def callback(message):
     global deliveries, untracked, bad_payloads, first_msg_t, last_msg_t
     global latency_sum, latency_max
     global earliest_breadcrumb, latest_breadcrumb
-    global invalid_timestamps, current_date, prev_date
+    global invalid_timestamps, prev_date
     global filename, backup_file
     now = time.time()
     today = datetime.now().strftime("%Y%m%d")
