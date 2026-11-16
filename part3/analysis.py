@@ -21,7 +21,7 @@ from psycopg2.extras import execute_values
 
 # Configuration
 PROJECT_ID = 'dataeng-project-511022'
-SUBSCRIPTION_ID = 'analysis_sub'
+SUBSCRIPTION_ID = 'se_analysis_sub'
 
 # How many messages can be held unacknowledged at once
 flow_control = FlowControl(max_messages=10000)
