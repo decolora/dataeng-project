@@ -176,7 +176,7 @@ def callback(message):
     global deliveries, untracked, bad_payloads, first_msg_t, last_msg_t
     global latency_sum, latency_max
     global earliest_breadcrumb, latest_breadcrumb
-    global invalid_timestamps, current_date, prev_date
+    global invalid_timestamps, prev_date
     global filename, backup_file
     now = time.time()
     today = datetime.now().strftime("%Y%m%d")

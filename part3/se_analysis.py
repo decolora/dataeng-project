@@ -27,24 +27,24 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
-#Create a transformer: EPSG (Oregon State Plane North, feet) -> WGS 84
+# Create a transformer: EPSG (Oregon State Plane North, feet) -> WGS 84
 _transformer = Transformer.from_crs("EPSG:2913", "EPSG:4326", always_xy=True)
 
 # Portland area boundaries
 PDXAREA_LAT_MIN, PDX_AREA_LAT_MAX = 45.0, 46.0
 PDXAREA_LON_MIN, PDX_AREA_LON_MAX = -123.5, -122.0
 
-TABLE_NAME = "StopEvent"       # table name for the database
+TABLE_NAME = "StopEvent"        # table name for the database
 BATCH_SIZE = 1000               # number of records to insert in a single batch
 
 # Column names for the database table
 COLUMNS = [
-    "vehicle_number", "leave_time","train","route_number",
-    "direction","service_key","trip_number","stop_time",
-    "arrive_time","dwell","location_id","door","lift",
-    "ons","offs","estimated_load","maximum_speed",
-    "train_mileage","pattern_distance","location_distance",
-    "GPS_latitude","GPS_longitude","data_source","schedule_status",
+    "vehicle_number", "leave_time", "train", "route_number",
+    "direction", "service_key", "trip_number", "stop_time",
+    "arrive_time", "dwell", "location_id", "door", "lift",
+    "ons", "offs", "estimated_load", "maximum_speed",
+    "train_mileage", "pattern_distance", "location_distance",
+    "GPS_latitude", "GPS_longitude", "data_source", "schedule_status",
 ]
 
 # Check if the project ID exists
@@ -113,14 +113,13 @@ elapsed = 0.0
 active = 0.0
 
 invalid_timestamps = 0          # the number of invalid timestamps
-
 invalid_records_list = []       # the list of invalid records with violations
 
 conn = None                     # database connection
 batch_buffer = []               # buffer for batch inserts
 stored = 0                      # the number of records successfully inserted
 
-same_trip_incr_arrive = {}      #stores the different arrival times with same trip number
+same_trip_incr_arrive = {}      # stores the different arrival times with same trip number
 
 
 # Reset all statistics data structures
@@ -151,7 +150,6 @@ def reset_daily_stats(date_str):
         # writes the invalid data from previous day to a json file
         write_invalid_records(invalid_records_list, date_str)
         invalid_records_list.clear()
-
 
     print(f"{date_str} — RESET ALL STATISTICS AND WAIT FOR THE NEW DAY.")
 
@@ -190,7 +188,7 @@ def validate_record(record):
     # --- Assertion 1: arrive_time must be in the range [0, 108000] (Limit) ---
     arrive_t = record.get("arrive_time")
     if arrive_t is None or not (0 <= arrive_t <= 108000):
-        violations.append("A1: Arrive_time is null or out of range [0, 108000]")
+        violations.append("A1: The arrive_time is null or out of range [0, 108000]")
 
     # --- Assertion 2: leave_time must be greater or equal to the arrival time (Intra-record) ---
     leave_t = record.get("leave_time")
@@ -200,17 +198,17 @@ def validate_record(record):
     # --- Assertion 3: The location_id must be non-null and not empty (Existence) ---
     loc_id = record.get("location_id")
     if loc_id is None:
-        violations.append("A3: Location_id is null or empty!")
+        violations.append("A3: The location_id is null or empty!")
 
     # --- Assertion 4: dwell must be less or equal to the difference of leave_time and arrive_time (Intra-record) ---
     dwell = record.get("dwell")
     if dwell is None or not (dwell <= (leave_t - arrive_t)):
-        violations.append("A4: dwell is null or greater than the difference of leave_time and arrive_time!")
+        violations.append("A4: The dwell is null or greater than the difference of leave_time and arrive_time!")
 
     # --- Assertion 5: direction must be either 0 or 1	(Limit) ---
     direction = record.get("direction")
     if direction is None or direction not in (0,1):
-        violations.append("A5: direction is null or neither 0 nor 1!")
+        violations.append("A5: The direction is null or neither 0 nor 1!")
 
     # --- Assertion 6: Within the same trip_number, the arrive_time must be increasing across consecutive stops	(Inter-record) ---
     trip_n = record.get("trip_number")
@@ -229,8 +227,7 @@ def validate_record(record):
     # Doc: the value of the Leave Time column has been set to the value of the recorded arrive time at the Last Stop of Trip
     if schedule_status == 6:
         if not (leave_t == arrive_t):
-            violations.append("A8: leave_time is not arrive_time when schedule_status is 6!")
-	
+            violations.append("A8: The leave_time is not the same as the arrive_time when schedule_status is 6!")
 
     # --- Log and return result ---
     if violations:
@@ -257,7 +254,7 @@ def write_invalid_records(invalid_records, run_date=None):
     print(f"Wrote {len(invalid_records)} invalid records to {filename}")
 
 
-#transforms from seconds to timestamp
+# Transforms from seconds to timestamp
 def _sec_to_timestamp(seconds_value, base_date):
     if seconds_value is None or str(seconds_value).strip() == "":
         return None
@@ -265,8 +262,8 @@ def _sec_to_timestamp(seconds_value, base_date):
     return midnight + timedelta(seconds=int(float(seconds_value)))
 
 # Transforms the arrive_time, stop_time, leave_time into timestamps
-#and add them into the base service_date
-#the service_date in this case is the today's date
+# and add them into the base service_date
+# The service_date in this case is the today's date
 def time_fields_to_timestamps (arrive_t, stop_t, leave_t):
     service_date = date.today()
     arrive_seconds = _sec_to_timestamp(arrive_t, service_date)
@@ -274,7 +271,7 @@ def time_fields_to_timestamps (arrive_t, stop_t, leave_t):
     leave_seconds = _sec_to_timestamp(leave_t, service_date)
     return arrive_seconds, stop_seconds, leave_seconds
 
-#Convert Oregon State Plane Coordinate System coordinates (EPSG:2913)
+# Convert Oregon State Plane Coordinate System coordinates (EPSG:2913)
 # to WGS 84 GPS latitude and longitude.
 def state_plane_to_latlon(x_coordinate, y_coordinate):
     lon, lat = _transformer.transform(x_coordinate, y_coordinate)
@@ -340,7 +337,7 @@ def flush_record():
                 logging.error(f"Error rolling back transaction: {r}")
 
 
-# TODO: Loads the transformed data into the database
+# Loads the transformed data into the database
 def load_record(record):
     global batch_buffer
     global stored
@@ -401,7 +398,6 @@ def callback(message):
             message.ack()
             return
 
-
         tracker = runs.setdefault(run_id, RunTracker(expected_total))
 
         # if the message's expected total is higher than the current total,
@@ -414,7 +410,7 @@ def callback(message):
         else:
             untracked += 1
         
-        # TODO: transforms data before loading into the database
+        # transforms data before loading into the database
         if isinstance(payload, dict) and valid_record:
                 try:
                     arrive_ts, stop_ts, leave_ts = time_fields_to_timestamps(
@@ -428,7 +424,7 @@ def callback(message):
 
                     x_val = payload.get("x_coordinate")
                     y_val = payload.get("y_coordinate")
-                    if x_val not in (None, "") and y_val not in (None, ""): #not null or not empty
+                    if x_val not in (None, "") and y_val not in (None, ""):
                         lat, lon = state_plane_to_latlon(float(x_val), float(y_val))
                         payload["GPS_latitude"] = lat
                         payload["GPS_longitude"] = lon
@@ -436,7 +432,8 @@ def callback(message):
                         payload["GPS_latitude"] = None
                         payload["GPS_longitude"] = None
 
-                    valid_to_load = payload["arrive_time"] is not None #arrive_time is one of PRIMARY KEY
+                    # arrive_time is a PRIMARY KEY
+                    valid_to_load = payload["arrive_time"] is not None
                 except Exception as e:
                     logging.error(f"Error transforming record: {e}")
 
