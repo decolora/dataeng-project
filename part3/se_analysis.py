@@ -168,6 +168,7 @@ def print_summary(today):
               f'   (publish to receive)')
     print(f'Untracked msgs     : {untracked}   (no run_id/seq attributes)')
     print(f'Bad payloads       : {bad_payloads}')
+    print(f'Invalid records    : {len(invalid_records_list)}')
     print(f'Stored records     : {stored}')
 
     for run_id, t in runs.items():
