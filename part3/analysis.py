@@ -96,6 +96,7 @@ subscriber.get_subscription(subscription=sub_path)
 
 # Shared state
 lock = threading.Lock()
+flush_lock = threading.Lock()   # lock for flushing records to the database
 runs = {}                       # run_id -> RunTracker
 deliveries = 0                  # every call
 untracked = 0                   # messages without valid run_id/seq attributes
@@ -371,42 +372,55 @@ def get_connection():
 
 # Flushes the batch buffer; batch buffer holds BATCH_SIZE records
 def flush_record():
-    global batch_buffer
-    to_insert = []
+    global batch_buffer, stored
+    # to_insert = []
 
-    with lock:
-        if not batch_buffer:
-            return
-        to_insert = batch_buffer
-        batch_buffer = []
+    with flush_lock:
+        with lock:
+            if not batch_buffer:
+                return
+            to_insert = batch_buffer
+            batch_buffer = []
 
-    # executes the batch insert outside of lock
-    conn = get_connection()
-    if conn:
+        # executes the batch insert outside of lock
+        conn = None
         try:
+            conn = get_connection()
+            if not conn:
+                raise Exception("get_connection() returned None.")
+
             with conn.cursor() as cur:
                 cols = ', '.join(COLUMNS)
                 query = f"INSERT INTO {TABLE_NAME} ({cols}) VALUES %s"
                 execute_values(cur, query, to_insert, page_size=BATCH_SIZE)
             conn.commit()
+
+            with lock:
+                stored += len(to_insert)
         except Exception as e:
             logging.error(f"Error flushing records to database: {e}")
-            try:
-                conn.rollback()
-            except Exception as r:
-                logging.error(f"Error rolling back transaction: {r}")
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception as r:
+                    logging.error(f"Error rolling back transaction: {r}")
+            
+            with lock:
+                # re-add the records to the batch buffer if connection fails
+                batch_buffer.extend(to_insert)
+        finally:
+            if conn:
+                conn.close()
 
 
 # Loads the transformed data into the database
 def load_record(record):
     global batch_buffer
-    global stored
     values = tuple(record.get(col) for col in COLUMNS)
     should_flush = False
 
     with lock:
         batch_buffer.append(values)
-        stored += 1
         if len(batch_buffer) >= BATCH_SIZE:
             should_flush = True
 

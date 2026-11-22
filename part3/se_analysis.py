@@ -1,3 +1,7 @@
+# se_analysis.py
+# Pulls StopEvent messages from a Pub/Sub subscription.
+# Usage: python3 se_analysis.py se_analysis_sub
+
 import json
 import logging
 import os
@@ -99,6 +103,7 @@ subscriber.get_subscription(subscription=sub_path)
 
 # Shared state
 lock = threading.Lock()
+flush_lock = threading.Lock()   # lock for flushing records to the database
 runs = {}                       # run_id -> RunTracker
 deliveries = 0                  # every call
 untracked = 0                   # messages without valid run_id/seq attributes
@@ -119,8 +124,6 @@ conn = None                     # database connection
 batch_buffer = []               # buffer for batch inserts
 stored = 0                      # the number of records successfully inserted
 
-same_trip_incr_arrive = {}      # stores the different arrival times with same trip number
-
 
 # Reset all statistics data structures
 def reset_daily_stats(date_str):
@@ -129,7 +132,6 @@ def reset_daily_stats(date_str):
     global invalid_timestamps
     global invalid_records_list
     global stored
-    global same_trip_incr_arrive
 
     # flushes any remaining records in the batch buffer
     flush_record()
@@ -144,7 +146,6 @@ def reset_daily_stats(date_str):
     latency_max = 0.0
     invalid_timestamps = 0
     stored = 0
-    same_trip_incr_arrive.clear()
 
     if invalid_records_list:
         # writes the invalid data from previous day to a json file
@@ -183,40 +184,37 @@ def print_summary(today):
 # Returns True if the record passes all validation assertions, False otherwise
 def validate_record(record):
     violations = []
-    global same_trip_incr_arrive
     
     # --- Assertion 1: arrive_time must be in the range [0, 108000] (Limit) ---
     arrive_t = record.get("arrive_time")
     if arrive_t is None or not (0 <= arrive_t <= 108000):
         violations.append("A1: The arrive_time is null or out of range [0, 108000]")
 
-    # --- Assertion 2: leave_time must be greater or equal to the arrival time (Intra-record) ---
+    # --- Assertion 2: leave_time and arrive_time must be non-null or non-empty (Existence) ---
     leave_t = record.get("leave_time")
-    if leave_t is None or not (leave_t >= arrive_t):
-        violations.append("A2: The leave_time is null or less than arrive_time!")
+    if leave_t is None or arrive_t is None:
+        violations.append("A2: The leave_time or arrive_time is null or empty!")
 
-    # --- Assertion 3: The location_id must be non-null and not empty (Existence) ---
-    loc_id = record.get("location_id")
-    if loc_id is None:
-        violations.append("A3: The location_id is null or empty!")
+    # --- Assertion 3: leave_time must be greater or equal to arrival time (Intra-record) ---
+    if arrive_t is not None:
+        if leave_t is None or not (leave_t >= arrive_t):
+            violations.append("A3: The leave_time is null or less than arrive_time!")
 
     # --- Assertion 4: dwell must be less or equal to the difference of leave_time and arrive_time (Intra-record) ---
     dwell = record.get("dwell")
-    if dwell is None or not (dwell <= (leave_t - arrive_t)):
-        violations.append("A4: The dwell is null or greater than the difference of leave_time and arrive_time!")
+    if leave_t is not None and arrive_t is not None:
+        if dwell is None or not (dwell <= (leave_t - arrive_t)):
+            violations.append("A4: The dwell is null or greater than the difference of leave_time and arrive_time!")
 
-    # --- Assertion 5: direction must be either 0 or 1	(Limit) ---
+    # --- Assertion 5: direction must be either 0 or 1 (Limit) ---
     direction = record.get("direction")
     if direction is None or direction not in (0,1):
         violations.append("A5: The direction is null or neither 0 nor 1!")
 
-    # --- Assertion 6: Within the same trip_number, the arrive_time must be increasing across consecutive stops	(Inter-record) ---
-    trip_n = record.get("trip_number")
-    if trip_n in same_trip_incr_arrive:
-        if same_trip_incr_arrive[trip_n] > arrive_t:
-            violations.append("A6: The arrive_time is decreasing!")
-    else:
-        same_trip_incr_arrive[trip_n] = arrive_t
+    # --- Assertion 6: The location_id must be non-null and not empty (Existence) ---
+    loc_id = record.get("location_id")
+    if loc_id is None:
+        violations.append("A6: The location_id is null or empty!")
 
     # --- Assertion 7: schedule_status must be non-null or empty (Existence) ---
     schedule_status = record.get("schedule_status")
@@ -246,7 +244,7 @@ def write_invalid_records(invalid_records, run_date=None):
     if run_date is None:
         run_date = date.today().isoformat()
 
-    filename = f"invalid_data_{run_date}.json"
+    filename = f"se_invalid_data_{run_date}.json"
 
     with open(filename, "w") as f:
         json.dump(invalid_records, f, indent=2, default=str)
@@ -256,10 +254,12 @@ def write_invalid_records(invalid_records, run_date=None):
 
 # Transforms from seconds to timestamp
 def _sec_to_timestamp(seconds_value, base_date):
+    if base_date is None:
+        return None
     if seconds_value is None or str(seconds_value).strip() == "":
         return None
-    midnight = datetime.combine(base_date, time.min)
-    return midnight + timedelta(seconds=int(float(seconds_value)))
+    base_datetime = datetime.strptime(base_date, "%Y-%m-%d")
+    return base_datetime + timedelta(seconds=int(seconds_value))
 
 # Transforms the arrive_time, stop_time, leave_time into timestamps
 # and add them into the base service_date
@@ -310,42 +310,55 @@ def get_connection():
 
 # Flushes the batch buffer; batch buffer holds BATCH_SIZE records
 def flush_record():
-    global batch_buffer
-    to_insert = []
+    global batch_buffer, stored
+    # to_insert = []
 
-    with lock:
-        if not batch_buffer:
-            return
-        to_insert = batch_buffer
-        batch_buffer = []
+    with flush_lock:
+        with lock:
+            if not batch_buffer:
+                return
+            to_insert = batch_buffer
+            batch_buffer = []
 
-    # executes the batch insert outside of lock
-    conn = get_connection()
-    if conn:
+        # executes the batch insert outside of lock
+        conn = None
         try:
+            conn = get_connection()
+            if not conn:
+                raise Exception("get_connection() returned None.")
+
             with conn.cursor() as cur:
                 cols = ', '.join(COLUMNS)
                 query = f"INSERT INTO {TABLE_NAME} ({cols}) VALUES %s"
                 execute_values(cur, query, to_insert, page_size=BATCH_SIZE)
             conn.commit()
+
+            with lock:
+                stored += len(to_insert)
         except Exception as e:
             logging.error(f"Error flushing records to database: {e}")
-            try:
-                conn.rollback()
-            except Exception as r:
-                logging.error(f"Error rolling back transaction: {r}")
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception as r:
+                    logging.error(f"Error rolling back transaction: {r}")
+            
+            with lock:
+                # re-add the records to the batch buffer if connection fails
+                batch_buffer.extend(to_insert)
+        finally:
+            if conn:
+                conn.close()
 
 
 # Loads the transformed data into the database
 def load_record(record):
     global batch_buffer
-    global stored
     values = tuple(record.get(col) for col in COLUMNS)
     should_flush = False
 
     with lock:
         batch_buffer.append(values)
-        stored += 1
         if len(batch_buffer) >= BATCH_SIZE:
             should_flush = True
 

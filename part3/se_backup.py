@@ -127,7 +127,7 @@ def compress_daily_backup(filename, backup_file):
     backup_size = os.path.getsize(filename) # size of backup file before compression
     archive_name = filename + '.gz'
 
-    with gzip.open(archive_name, 'w', encoding='utf-8') as backup_zip:
+    with gzip.open(archive_name, 'wt', encoding='utf-8') as backup_zip:
         with open(filename, 'r', encoding='utf-8') as f:
             backup_zip.write(f.read())
 

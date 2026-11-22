@@ -76,6 +76,36 @@ if not VEHICLE_IDS:
 # Print a unique RunID for this run of the publisher.
 RUN_ID = time.strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
 
+# Column names and data types for type conversion
+COLUMNS = {
+    "vehicle_number": int, "leave_time": int, "train": int,
+    "route_number": int, "direction": int, "service_key": str,
+    "trip_number": int, "stop_time": int, "arrive_time": int,
+    "dwell": int, "location_id": int, "door": int,
+    "lift": int, "ons": int, "offs": int, "estimated_load": int,
+    "maximum_speed": int, "train_mileage": float,
+    "pattern_distance": float, "location_distance": float,
+    "GPS_latitude": float, "GPS_longitude": float,
+    "data_source": int, "schedule_status": int
+}
+
+# Convert the values in the record to the specified types
+def convert_types(record):
+    for col, col_type in COLUMNS.items():
+        if col in record:
+            value = record[col]
+            if isinstance(value, str):
+                value = value.strip()
+
+            if value is not None and value != "":
+                try:
+                    record[col] = col_type(value)
+                except (ValueError, TypeError):
+                    record[col] = None
+            else:
+                record[col] = None
+    return record
+
 # Completion tracking (background threads)
 done_cv = threading.Condition()
 ok = 0
@@ -102,7 +132,7 @@ last_progress = start
 unique_stop_events = set()
 
 # Regex patterns to extract service date and trip number from HTML response
-service_date_pattern = r"Trimet CAD/AVL stop date for (\d{4}-\d{2}-\d{2})"
+service_date_pattern = r"(\d{4}-\d{2}-\d{2})"
 trip_num_pattern = r"Stop events for PDX_TRIP (\d+)"
 
 # Process all vehicle IDs
@@ -114,7 +144,7 @@ for vid in VEHICLE_IDS:
         data = BeautifulSoup(resp.text, 'html.parser')
         time.sleep(0.1)
 
-        # find the servide date in the response
+        # find the service date in the response
         h1_tag = data.find('h1')
         service_date = None
         if h1_tag:
@@ -131,9 +161,9 @@ for vid in VEHICLE_IDS:
             trip_match = re.search(trip_num_pattern, tag.get_text(strip=True))
             if trip_match is None:
                 continue
-            service_date = service_date
-            trip_num = trip_match.group(1)
-            unique_stop_events.add(trip_num)
+            trip_number = trip_match.group(1).strip()
+            trip_number = int(trip_number) if trip_number.isdigit() else None
+            unique_stop_events.add(trip_number)
 
             # find the table associated with the trip number
             table = tag.find_next('table')
@@ -148,7 +178,9 @@ for vid in VEHICLE_IDS:
                 values = [c.get_text(strip=True) for c in row.find_all('td')]
                 # create a record by mapping the headers and values
                 record = dict(zip(headers, values))
-                record['trip_num'] = trip_num
+                record['service_date'] = service_date
+                record['trip_number'] = trip_number
+                record = convert_types(record)
                 total += 1
 
                 # publish the records
