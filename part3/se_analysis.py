@@ -1,3 +1,7 @@
+# se_analysis.py
+# Pulls StopEvent messages from a Pub/Sub subscription.
+# Usage: python3 se_analysis.py se_analysis_sub
+
 import json
 import logging
 import os
@@ -99,6 +103,7 @@ subscriber.get_subscription(subscription=sub_path)
 
 # Shared state
 lock = threading.Lock()
+flush_lock = threading.Lock()   # lock for flushing records to the database
 runs = {}                       # run_id -> RunTracker
 deliveries = 0                  # every call
 untracked = 0                   # messages without valid run_id/seq attributes
@@ -246,7 +251,7 @@ def write_invalid_records(invalid_records, run_date=None):
     if run_date is None:
         run_date = date.today().isoformat()
 
-    filename = f"invalid_data_{run_date}.json"
+    filename = f"se_invalid_data_{run_date}.json"
 
     with open(filename, "w") as f:
         json.dump(invalid_records, f, indent=2, default=str)
@@ -256,10 +261,12 @@ def write_invalid_records(invalid_records, run_date=None):
 
 # Transforms from seconds to timestamp
 def _sec_to_timestamp(seconds_value, base_date):
+    if base_date is None:
+        return None
     if seconds_value is None or str(seconds_value).strip() == "":
         return None
-    midnight = datetime.combine(base_date, time.min)
-    return midnight + timedelta(seconds=int(float(seconds_value)))
+    base_datetime = datetime.strptime(base_date, "%Y-%m-%d")
+    return base_datetime + timedelta(seconds=int(seconds_value))
 
 # Transforms the arrive_time, stop_time, leave_time into timestamps
 # and add them into the base service_date
@@ -310,42 +317,55 @@ def get_connection():
 
 # Flushes the batch buffer; batch buffer holds BATCH_SIZE records
 def flush_record():
-    global batch_buffer
-    to_insert = []
+    global batch_buffer, stored
+    # to_insert = []
 
-    with lock:
-        if not batch_buffer:
-            return
-        to_insert = batch_buffer
-        batch_buffer = []
+    with flush_lock:
+        with lock:
+            if not batch_buffer:
+                return
+            to_insert = batch_buffer
+            batch_buffer = []
 
-    # executes the batch insert outside of lock
-    conn = get_connection()
-    if conn:
+        # executes the batch insert outside of lock
+        conn = None
         try:
+            conn = get_connection()
+            if not conn:
+                raise Exception("get_connection() returned None.")
+
             with conn.cursor() as cur:
                 cols = ', '.join(COLUMNS)
                 query = f"INSERT INTO {TABLE_NAME} ({cols}) VALUES %s"
                 execute_values(cur, query, to_insert, page_size=BATCH_SIZE)
             conn.commit()
+
+            with lock:
+                stored += len(to_insert)
         except Exception as e:
             logging.error(f"Error flushing records to database: {e}")
-            try:
-                conn.rollback()
-            except Exception as r:
-                logging.error(f"Error rolling back transaction: {r}")
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception as r:
+                    logging.error(f"Error rolling back transaction: {r}")
+            
+            with lock:
+                # re-add the records to the batch buffer if connection fails
+                batch_buffer.extend(to_insert)
+        finally:
+            if conn:
+                conn.close()
 
 
 # Loads the transformed data into the database
 def load_record(record):
     global batch_buffer
-    global stored
     values = tuple(record.get(col) for col in COLUMNS)
     should_flush = False
 
     with lock:
         batch_buffer.append(values)
-        stored += 1
         if len(batch_buffer) >= BATCH_SIZE:
             should_flush = True
 
