@@ -329,7 +329,8 @@ def flush_record():
 
             with conn.cursor() as cur:
                 cols = ', '.join(COLUMNS)
-                query = f"INSERT INTO {TABLE_NAME} ({cols}) VALUES %s"
+                query = (f"INSERT INTO {TABLE_NAME} ({cols}) VALUES %s"
+                         "ON CONFLICT (vehicle_number, trip_number, arrive_time) DO NOTHING")
                 execute_values(cur, query, to_insert, page_size=BATCH_SIZE)
             conn.commit()
 
