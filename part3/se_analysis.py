@@ -124,8 +124,6 @@ conn = None                     # database connection
 batch_buffer = []               # buffer for batch inserts
 stored = 0                      # the number of records successfully inserted
 
-same_trip_incr_arrive = {}      # stores the different arrival times with same trip number
-
 
 # Reset all statistics data structures
 def reset_daily_stats(date_str):
@@ -134,7 +132,6 @@ def reset_daily_stats(date_str):
     global invalid_timestamps
     global invalid_records_list
     global stored
-    global same_trip_incr_arrive
 
     # flushes any remaining records in the batch buffer
     flush_record()
@@ -149,7 +146,6 @@ def reset_daily_stats(date_str):
     latency_max = 0.0
     invalid_timestamps = 0
     stored = 0
-    same_trip_incr_arrive.clear()
 
     if invalid_records_list:
         # writes the invalid data from previous day to a json file
@@ -188,40 +184,37 @@ def print_summary(today):
 # Returns True if the record passes all validation assertions, False otherwise
 def validate_record(record):
     violations = []
-    global same_trip_incr_arrive
     
     # --- Assertion 1: arrive_time must be in the range [0, 108000] (Limit) ---
     arrive_t = record.get("arrive_time")
     if arrive_t is None or not (0 <= arrive_t <= 108000):
         violations.append("A1: The arrive_time is null or out of range [0, 108000]")
 
-    # --- Assertion 2: leave_time must be greater or equal to the arrival time (Intra-record) ---
+    # --- Assertion 2: leave_time and arrive_time must be non-null or non-empty (Existence) ---
     leave_t = record.get("leave_time")
-    if leave_t is None or not (leave_t >= arrive_t):
-        violations.append("A2: The leave_time is null or less than arrive_time!")
+    if leave_t is None or arrive_t is None:
+        violations.append("A2: The leave_time or arrive_time is null or empty!")
 
-    # --- Assertion 3: The location_id must be non-null and not empty (Existence) ---
-    loc_id = record.get("location_id")
-    if loc_id is None:
-        violations.append("A3: The location_id is null or empty!")
+    # --- Assertion 3: leave_time must be greater or equal to arrival time (Intra-record) ---
+    if arrive_t is not None:
+        if leave_t is None or not (leave_t >= arrive_t):
+            violations.append("A3: The leave_time is null or less than arrive_time!")
 
     # --- Assertion 4: dwell must be less or equal to the difference of leave_time and arrive_time (Intra-record) ---
     dwell = record.get("dwell")
-    if dwell is None or not (dwell <= (leave_t - arrive_t)):
-        violations.append("A4: The dwell is null or greater than the difference of leave_time and arrive_time!")
+    if leave_t is not None and arrive_t is not None:
+        if dwell is None or not (dwell <= (leave_t - arrive_t)):
+            violations.append("A4: The dwell is null or greater than the difference of leave_time and arrive_time!")
 
-    # --- Assertion 5: direction must be either 0 or 1	(Limit) ---
+    # --- Assertion 5: direction must be either 0 or 1 (Limit) ---
     direction = record.get("direction")
     if direction is None or direction not in (0,1):
         violations.append("A5: The direction is null or neither 0 nor 1!")
 
-    # --- Assertion 6: Within the same trip_number, the arrive_time must be increasing across consecutive stops	(Inter-record) ---
-    trip_n = record.get("trip_number")
-    if trip_n in same_trip_incr_arrive:
-        if same_trip_incr_arrive[trip_n] > arrive_t:
-            violations.append("A6: The arrive_time is decreasing!")
-    else:
-        same_trip_incr_arrive[trip_n] = arrive_t
+    # --- Assertion 6: The location_id must be non-null and not empty (Existence) ---
+    loc_id = record.get("location_id")
+    if loc_id is None:
+        violations.append("A6: The location_id is null or empty!")
 
     # --- Assertion 7: schedule_status must be non-null or empty (Existence) ---
     schedule_status = record.get("schedule_status")
